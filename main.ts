@@ -1,134 +1,214 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import { Plugin, TFile, TFolder, Notice, PluginSettingTab, Setting, App, SuggestModal } from 'obsidian';
+import { ExifParserFactory } from 'ts-exif-parser';
+import * as yaml from 'js-yaml';
 
-// Remember to rename these classes and interfaces!
 
-interface MyPluginSettings {
-	mySetting: string;
+interface ImageToMarkdownSettings {
+    useMarkdownLinks: boolean;
+    yamlProperties: string;
+    tags: string;
+    templatePath: string;
 }
 
-const DEFAULT_SETTINGS: MyPluginSettings = {
-	mySetting: 'default'
+const DEFAULT_SETTINGS: ImageToMarkdownSettings = {
+    useMarkdownLinks: true,
+    yamlProperties: '',
+    tags: '',
+    templatePath: ''
+};
+
+export default class ImageToMarkdownPlugin extends Plugin {
+    settings: ImageToMarkdownSettings;
+
+    async onload() {
+        await this.loadSettings();
+
+        this.addSettingTab(new ImageToMarkdownSettingTab(this.app, this));
+
+        this.registerEvent(this.app.workspace.on('file-menu', (menu, abstractFile) => {
+            if (abstractFile instanceof TFile && ['png', 'jpg', 'jpeg', 'gif'].includes(abstractFile.extension.toLowerCase())) {
+                menu.addItem((item) => {
+                    item.setTitle('Generate Markdown for Image')
+                        .setIcon('document')
+                        .onClick(async () => {
+                            await this.createMarkdownForImage(abstractFile);
+                        });
+                });
+            } else if (abstractFile instanceof TFolder) {
+                menu.addItem((item) => {
+                    item.setTitle('Generate Markdown for All Images in Folder')
+                        .setIcon('document')
+                        .onClick(async () => {
+                            await this.createMarkdownForFolder(abstractFile);
+                        });
+                });
+            }
+        }));
+    }
+
+	
+    async loadSettings() {
+        this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    }
+
+    async saveSettings() {
+        await this.saveData(this.settings);
+    }
+
+    async createMarkdownForImage(file: TFile) {
+        if (!file.parent) {
+            new Notice("The file has no parent path");
+            return;
+        }
+
+        const fileName = file.basename;
+        const filePath = file.path;
+
+        // Lesen der Bilddaten
+        const arrayBuffer = await this.app.vault.adapter.readBinary(filePath);
+        const parser = ExifParserFactory.create(arrayBuffer);
+        const exifData = parser.parse();
+
+        // EXIF-Daten in YAML-Format umwandeln
+        let yamlFrontmatter = '---\n';
+        const tags = exifData.tags ?? {};
+        for (const [key, value] of Object.entries(tags)) {
+            yamlFrontmatter += `${key}: ${value}\n`;
+        }
+
+        // Benutzerdefinierte YAML-Eigenschaften hinzufügen
+        const customProperties = this.settings.yamlProperties.split(',').map(prop => prop.trim());
+        customProperties.forEach(prop => {
+            const [key, value] = prop.split(':').map(part => part.trim());
+            yamlFrontmatter += `${key}: ${value}\n`;
+        });
+
+        // Tags hinzufügen
+        if (this.settings.tags) {
+            const tagsList = this.settings.tags.split(',').map(tag => tag.trim()).join(', ');
+            yamlFrontmatter += `tags: ${tagsList}\n`;
+        }
+
+        // Aktuelles Datum im ISO-Format "YYYY-MM-DD"
+        const currentDate = new Date();
+        const formattedDate = `${currentDate.getFullYear()}-${String(currentDate.getMonth() + 1).padStart(2, '0')}-${String(currentDate.getDate()).padStart(2, '0')}`;
+        yamlFrontmatter += `created: ${formattedDate}\n`;
+        yamlFrontmatter += '---\n';
+
+        const encodedFilePath = encodeURI(filePath);
+        const link = this.settings.useMarkdownLinks ? `[${fileName}](${encodedFilePath})` : `[[${filePath}]]`;
+        const markdownContent = `${yamlFrontmatter}\n${link}`;
+
+        const newFilePath = `${file.parent.path}/${fileName}.md`;
+        if (!await this.app.vault.adapter.exists(newFilePath)) {
+            await this.app.vault.create(newFilePath, markdownContent);
+            new Notice(`Markdown file created: ${newFilePath}`);
+        } else {
+            new Notice(`Markdown file already exists: ${newFilePath}`);
+        }
+    }
+
+    async createMarkdownForFolder(folder: TFolder) {
+        const files = this.app.vault.getFiles();
+        const imageFiles = files.filter(file => file.path.startsWith(folder.path) && ['png', 'jpg', 'jpeg', 'gif'].includes(file.extension.toLowerCase()));
+
+        for (const file of imageFiles) {
+            await this.createMarkdownForImage(file);
+        }
+    }
+
 }
 
-export default class MyPlugin extends Plugin {
-	settings: MyPluginSettings;
+class TemplateSuggestModal extends SuggestModal<string> {
+    plugin: ImageToMarkdownPlugin;
 
-	async onload() {
-		await this.loadSettings();
+    constructor(app: App, plugin: ImageToMarkdownPlugin) {
+        super(app);
+        this.plugin = plugin;
+    }
 
-		// This creates an icon in the left ribbon.
-		const ribbonIconEl = this.addRibbonIcon('dice', 'Sample Plugin', (evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
-		});
-		// Perform additional things with the ribbon
-		ribbonIconEl.addClass('my-plugin-ribbon-class');
+    getSuggestions(query: string): string[] {
+        return this.plugin.app.vault.getMarkdownFiles()
+            .map(file => file.path)
+            .filter(path => path.toLowerCase().includes(query.toLowerCase()));
+    }
 
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status Bar Text');
+    renderSuggestion(templatePath: string, el: HTMLElement) {
+        el.createEl('div', { text: templatePath });
+    }
 
-		// This adds a simple command that can be triggered anywhere
-		this.addCommand({
-			id: 'open-sample-modal-simple',
-			name: 'Open sample modal (simple)',
-			callback: () => {
-				new SampleModal(this.app).open();
-			}
-		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'sample-editor-command',
-			name: 'Sample editor command',
-			editorCallback: (editor: Editor, view: MarkdownView) => {
-				console.log(editor.getSelection());
-				editor.replaceSelection('Sample Editor Command');
-			}
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-sample-modal-complex',
-			name: 'Open sample modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
-					}
-
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
-				}
-			}
-		});
-
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
-
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-			console.log('click', evt);
-		});
-
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
-	}
-
-	onunload() {
-
-	}
-
-	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-	}
-
-	async saveSettings() {
-		await this.saveData(this.settings);
-	}
+    onChooseSuggestion(templatePath: string, evt: MouseEvent | KeyboardEvent) {
+        this.plugin.settings.templatePath = templatePath;
+        this.plugin.saveSettings();
+        new Notice(`Template selected: ${templatePath}`);
+    }
 }
 
-class SampleModal extends Modal {
-	constructor(app: App) {
-		super(app);
-	}
+class ImageToMarkdownSettingTab extends PluginSettingTab {
+    plugin: ImageToMarkdownPlugin;
 
-	onOpen() {
-		const {contentEl} = this;
-		contentEl.setText('Woah!');
-	}
+    constructor(app: App, plugin: ImageToMarkdownPlugin) {
+        super(app, plugin);
+        this.plugin = plugin;
+    }
 
-	onClose() {
-		const {contentEl} = this;
-		contentEl.empty();
-	}
-}
+    display(): void {
+        const { containerEl } = this;
 
-class SampleSettingTab extends PluginSettingTab {
-	plugin: MyPlugin;
+        containerEl.empty();
+        containerEl.createEl('h2', { text: 'Image to Markdown Settings' });
 
-	constructor(app: App, plugin: MyPlugin) {
-		super(app, plugin);
-		this.plugin = plugin;
-	}
+        new Setting(containerEl)
+            .setName('Use Markdown Links')
+            .setDesc('If enabled, links will be in Markdown format. If disabled, links will be in Wiki format.')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.useMarkdownLinks)
+                .onChange(async (value) => {
+                    this.plugin.settings.useMarkdownLinks = value;
+                    await this.plugin.saveSettings();
+                }));
 
-	display(): void {
-		const {containerEl} = this;
+        new Setting(containerEl)
+            .setName('YAML Properties')
+            .setDesc('Comma-separated list of YAML properties to add to each file. Format: key:value')
+            .addTextArea(text => text
+                .setPlaceholder('property1: value1, property2: value2')
+                .setValue(this.plugin.settings.yamlProperties)
+                .onChange(async (value) => {
+                    this.plugin.settings.yamlProperties = value;
+                    await this.plugin.saveSettings();
+                }));
 
-		containerEl.empty();
+        new Setting(containerEl)
+            .setName('Tags')
+            .setDesc('Comma-separated list of tags to add to each file. Do not include the # symbol.')
+            .addTextArea(text => text
+                .setPlaceholder('tag1, tag2, tag3')
+                .setValue(this.plugin.settings.tags)
+                .onChange(async (value) => {
+                    this.plugin.settings.tags = value;
+                    await this.plugin.saveSettings();
+                }));
 
-		new Setting(containerEl)
-			.setName('Setting #1')
-			.setDesc('It\'s a secret')
-			.addText(text => text
-				.setPlaceholder('Enter your secret')
-				.setValue(this.plugin.settings.mySetting)
-				.onChange(async (value) => {
-					this.plugin.settings.mySetting = value;
-					await this.plugin.saveSettings();
-				}));
-	}
+        new Setting(containerEl)
+            .setName('Template Path')
+            .setDesc('Path to the template file to apply to new markdown files.')
+            .addText(text => {
+                const textComponent = text
+                    .setPlaceholder('path/to/template.md')
+                    .setValue(this.plugin.settings.templatePath)
+                    .onChange(async (value) => {
+                        this.plugin.settings.templatePath = value;
+                        await this.plugin.saveSettings();
+                    });
+
+                // Hinzufügen einer Schaltfläche zum Durchsuchen der Vorlagen
+                const button = document.createElement('button');
+                button.setText('Browse');
+                button.addEventListener('click', () => {
+                    new TemplateSuggestModal(this.app, this.plugin).open();
+                });
+                textComponent.inputEl.parentElement?.appendChild(button);
+            });
+    }
 }
