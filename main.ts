@@ -1,4 +1,4 @@
-import { Plugin, TFile, TFolder, Notice, PluginSettingTab, Setting, App, SuggestModal } from 'obsidian';
+import { Plugin, TFile, TFolder, Notice, PluginSettingTab, Setting, App, SuggestModal, Vault } from 'obsidian';
 import { ExifParserFactory } from 'ts-exif-parser';
 import * as yaml from 'js-yaml';
 
@@ -6,15 +6,13 @@ import * as yaml from 'js-yaml';
 interface ImageToMarkdownSettings {
     useMarkdownLinks: boolean;
     yamlProperties: string;
-    tags: string;
-    templatePath: string;
+    targetPath: string;
 }
 
 const DEFAULT_SETTINGS: ImageToMarkdownSettings = {
     useMarkdownLinks: true,
     yamlProperties: '',
-    tags: '',
-    templatePath: ''
+    targetPath: ''
 };
 
 export default class ImageToMarkdownPlugin extends Plugin {
@@ -64,30 +62,37 @@ export default class ImageToMarkdownPlugin extends Plugin {
         const fileName = file.basename;
         const filePath = file.path;
 
+		new Notice("Reading image");
         // Lesen der Bilddaten
         const arrayBuffer = await this.app.vault.adapter.readBinary(filePath);
         const parser = ExifParserFactory.create(arrayBuffer);
         const exifData = parser.parse();
 
+		new Notice("generating yaml for");
+
         // EXIF-Daten in YAML-Format umwandeln
         let yamlFrontmatter = '---\n';
-        const tags = exifData.tags ?? {};
-        for (const [key, value] of Object.entries(tags)) {
-            yamlFrontmatter += `${key}: ${value}\n`;
-        }
+
+		if (exifData.getImageSize()) {
+			const height = exifData.getImageSize().height
+			yamlFrontmatter += `exif-height: ${height}\n`;
+			const width = exifData.getImageSize().width
+			yamlFrontmatter += `exif-width: ${width}\n`;
+		} else {
+			new Notice("No EXIF data")
+		}
+		const tags = exifData.tags ?? {};
+		for (const [key, value] of Object.entries(tags)) {
+			yamlFrontmatter += `exif-${key}: ${value}\n`;
+		}
 
         // Benutzerdefinierte YAML-Eigenschaften hinzufügen
-        const customProperties = this.settings.yamlProperties.split(',').map(prop => prop.trim());
+        const customProperties = this.settings.yamlProperties.split(/\r?\n/).map(prop => prop.trim());
         customProperties.forEach(prop => {
             const [key, value] = prop.split(':').map(part => part.trim());
             yamlFrontmatter += `${key}: ${value}\n`;
         });
-
-        // Tags hinzufügen
-        if (this.settings.tags) {
-            const tagsList = this.settings.tags.split(',').map(tag => tag.trim()).join(', ');
-            yamlFrontmatter += `tags: ${tagsList}\n`;
-        }
+		new Notice(yamlFrontmatter)
 
         // Aktuelles Datum im ISO-Format "YYYY-MM-DD"
         const currentDate = new Date();
@@ -95,8 +100,9 @@ export default class ImageToMarkdownPlugin extends Plugin {
         yamlFrontmatter += `created: ${formattedDate}\n`;
         yamlFrontmatter += '---\n';
 
+		new Notice(yamlFrontmatter)
         const encodedFilePath = encodeURI(filePath);
-        const link = this.settings.useMarkdownLinks ? `[${fileName}](${encodedFilePath})` : `[[${filePath}]]`;
+        const link = this.settings.useMarkdownLinks ? `![${fileName}](${encodedFilePath})` : `![[${filePath}]]`;
         const markdownContent = `${yamlFrontmatter}\n${link}`;
 
         const newFilePath = `${file.parent.path}/${fileName}.md`;
@@ -119,7 +125,7 @@ export default class ImageToMarkdownPlugin extends Plugin {
 
 }
 
-class TemplateSuggestModal extends SuggestModal<string> {
+class TargetDirSuggestModal extends SuggestModal<string> {
     plugin: ImageToMarkdownPlugin;
 
     constructor(app: App, plugin: ImageToMarkdownPlugin) {
@@ -138,9 +144,41 @@ class TemplateSuggestModal extends SuggestModal<string> {
     }
 
     onChooseSuggestion(templatePath: string, evt: MouseEvent | KeyboardEvent) {
-        this.plugin.settings.templatePath = templatePath;
+        this.plugin.settings.targetPath = templatePath;
         this.plugin.saveSettings();
         new Notice(`Template selected: ${templatePath}`);
+    }
+}
+
+class FolderSuggestModal extends SuggestModal<TFolder> {
+    plugin: ImageToMarkdownPlugin;
+
+    constructor(app: App, plugin: ImageToMarkdownPlugin) {
+        super(app);
+        this.plugin = plugin;
+    }
+
+    // Return all available folders in the vault
+    getSuggestions(query: string): TFolder[] {
+        const folders: TFolder[] = [];
+        Vault.recurseChildren(this.app.vault.getRoot(), (file) => {
+            if (file instanceof TFolder) {
+                folders.push(file);
+            }
+        });
+        return folders.filter((folder) => folder.path.toLowerCase().includes(query.toLowerCase()));
+    }
+
+    // Render each folder suggestion
+    renderSuggestion(folder: TFolder, el: HTMLElement) {
+        el.createEl('div', { text: folder.path });
+    }
+
+    // Handle the folder selection
+    onChooseSuggestion(folder: TFolder, evt: MouseEvent | KeyboardEvent) {
+        this.plugin.settings.targetPath = folder.path;
+        this.plugin.saveSettings();
+        new Notice(`Selected folder: ${folder.path}`);
     }
 }
 
@@ -170,35 +208,25 @@ class ImageToMarkdownSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName('YAML Properties')
-            .setDesc('Comma-separated list of YAML properties to add to each file. Format: key:value')
+            .setDesc('List of YAML properties to add to each file. Format: key:value. Add one property per line')
             .addTextArea(text => text
-                .setPlaceholder('property1: value1, property2: value2')
+                .setPlaceholder('property1: value1\n property2: value2')
                 .setValue(this.plugin.settings.yamlProperties)
                 .onChange(async (value) => {
                     this.plugin.settings.yamlProperties = value;
                     await this.plugin.saveSettings();
                 }));
 
-        new Setting(containerEl)
-            .setName('Tags')
-            .setDesc('Comma-separated list of tags to add to each file. Do not include the # symbol.')
-            .addTextArea(text => text
-                .setPlaceholder('tag1, tag2, tag3')
-                .setValue(this.plugin.settings.tags)
-                .onChange(async (value) => {
-                    this.plugin.settings.tags = value;
-                    await this.plugin.saveSettings();
-                }));
-
-        new Setting(containerEl)
-            .setName('Template Path')
-            .setDesc('Path to the template file to apply to new markdown files.')
+		/*
+		new Setting(containerEl)
+            .setName('Target Path')
+            .setDesc('Path to the folder to store to new markdown files.')
             .addText(text => {
                 const textComponent = text
-                    .setPlaceholder('path/to/template.md')
-                    .setValue(this.plugin.settings.templatePath)
+                    .setPlaceholder('target folder')
+                    .setValue(this.plugin.settings.targetPath)
                     .onChange(async (value) => {
-                        this.plugin.settings.templatePath = value;
+                        this.plugin.settings.targetPath = value;
                         await this.plugin.saveSettings();
                     });
 
@@ -206,9 +234,11 @@ class ImageToMarkdownSettingTab extends PluginSettingTab {
                 const button = document.createElement('button');
                 button.setText('Browse');
                 button.addEventListener('click', () => {
-                    new TemplateSuggestModal(this.app, this.plugin).open();
+                    new FolderSuggestModal(this.app, this.plugin).open();
                 });
                 textComponent.inputEl.parentElement?.appendChild(button);
             });
+		*/
+
     }
 }
